@@ -15,13 +15,15 @@ from .models import (
     ErrorResponse,
     HealthResponse,
     IngestRequest,
+    MatchRequest,
+    MatchResponse,
     MeterStateResponse,
     MeterSummary,
     MutationResponse,
     UndoRequest,
 )
 from .seed import seed_demo_data
-from .service import BatchRejected, ingest, list_meters, query_meter, undo
+from .service import BatchRejected, ingest, list_meters, match_meters, query_meter, undo
 
 _BUSY_MESSAGE = "database is locked"
 
@@ -49,7 +51,8 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
             "把网关补传的累计读数转换成区间用电量。\n\n"
             "* **入仓** `POST /api/v1/readings`：整批原子提交，乱序补传按电表号+时刻排序后求差。\n"
             "* **撤销** `POST /api/v1/readings/undo`：按源记录号撤销，并重算受影响区间。\n"
-            "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n\n"
+            "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n"
+            "* **匹配** `POST /api/v1/meters/match`：只读确认换编号后旧号与新号的一对一对应。\n\n"
             "同一源记录号重复提交相同内容为幂等重试；同号异内容、同表同刻冲突会整批拒绝（409）。"
         ),
         lifespan=lifespan,
@@ -158,6 +161,29 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
     def get_meters(request: Request) -> list[MeterSummary]:
         """列出所有电表的读数条数、区间数、断点数与累计用量。"""
         return list_meters(settings_of(request))
+
+    @app.post(
+        "/api/v1/meters/match",
+        response_model=MatchResponse,
+        responses={503: {"model": ErrorResponse}},
+        tags=["匹配"],
+    )
+    def match_meter_ids(payload: MatchRequest, request: Request) -> MatchResponse:
+        """只读匹配：确认网关维护后旧上报编号与新编号的一对一对应。
+
+        * 输入 2～6 个互异旧号与同等数量的互异新号，以及最长 24 小时的
+          UTC 重叠时段。
+        * 在**同一已提交快照**中比较双方同起止时刻的有效区间（完全落在
+          重叠时段内）。
+        * 一对编号成立的条件：存在连续三段共同有效区间用量相同，且这三段
+          中至少出现两种不同的正用量；共同有效区间一旦出现用量冲突，该
+          组合直接排除；断点或缺采样会打断连续证据，不能拼接。
+        * 仅当全局一对一对应唯一时返回 `matched`、全部配对及每段证据的
+          源记录号；证据不足（`insufficient_evidence`）、无完整对应
+          （`no_complete_matching`）或存在多种对应（`ambiguous`）时说明
+          原因，`pairs` 为空，不猜测部分配对。
+        """
+        return match_meters(settings_of(request), payload)
 
     @app.get(
         "/api/v1/meters/{meter_id}",

@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+from .timeutil import to_microseconds
+
+MAX_MATCH_WINDOW_US = 24 * 60 * 60 * 1_000_000  # 重叠时段最长 24 小时
 
 
 class ReadingIn(BaseModel):
@@ -150,6 +160,10 @@ class IntervalOut(BaseModel):
 
 
 class QueryWindow(BaseModel):
+    # populate_by_name lets the service build the response with `from_=` while
+    # the wire format keeps the `from` alias.
+    model_config = ConfigDict(populate_by_name=True)
+
     from_: str | None = Field(default=None, alias="from")
     to: str | None = None
     applied: bool
@@ -187,3 +201,105 @@ class ConflictResponse(BaseModel):
 class ErrorResponse(BaseModel):
     code: str
     message: str
+
+
+class MatchWindow(BaseModel):
+    """UTC overlap period in which the old and new ids are compared."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    from_: datetime = Field(
+        ..., alias="from", description="重叠时段起点（含），ISO-8601，按 UTC 解释"
+    )
+    to: datetime = Field(
+        ..., description="重叠时段终点（含），ISO-8601，按 UTC 解释"
+    )
+
+    @model_validator(mode="after")
+    def _bounds(self) -> "MatchWindow":
+        start = to_microseconds(self.from_)
+        end = to_microseconds(self.to)
+        if end <= start:
+            raise ValueError("window.to 必须晚于 window.from")
+        if end - start > MAX_MATCH_WINDOW_US:
+            raise ValueError("重叠时段最长 24 小时")
+        return self
+
+
+class MatchRequest(BaseModel):
+    """Old/new meter-id matching request (read-only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    old_meter_ids: list[str] = Field(
+        ..., min_length=2, max_length=6, description="旧上报编号，2～6 个且互异"
+    )
+    new_meter_ids: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=6,
+        description="新上报编号，数量与旧号相同，互异且不得与旧号重复",
+    )
+    window: MatchWindow
+
+    @field_validator("old_meter_ids", "new_meter_ids")
+    @classmethod
+    def _clean_ids(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                raise ValueError("meter ids must not be blank")
+            cleaned.append(value)
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("meter ids must be distinct")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "MatchRequest":
+        if len(self.old_meter_ids) != len(self.new_meter_ids):
+            raise ValueError("old_meter_ids 与 new_meter_ids 的数量必须相同")
+        duplicated = sorted(set(self.old_meter_ids) & set(self.new_meter_ids))
+        if duplicated:
+            raise ValueError(f"旧号与新号必须互异: {duplicated}")
+        return self
+
+
+class MatchEvidenceSegment(BaseModel):
+    """One consecutive equal-usage segment backing a matched pair."""
+
+    from_read_at: str
+    to_read_at: str
+    usage: int
+    old_from_source_record_id: str
+    old_to_source_record_id: str
+    new_from_source_record_id: str
+    new_to_source_record_id: str
+
+
+class MatchedPair(BaseModel):
+    old_meter_id: str
+    new_meter_id: str
+    evidence: list[MatchEvidenceSegment] = Field(
+        description="连续三段相同用量的共同有效区间（含双方源记录号）"
+    )
+
+
+class MatchResponse(BaseModel):
+    status: Literal[
+        "matched", "insufficient_evidence", "no_complete_matching", "ambiguous"
+    ] = Field(
+        description=(
+            "matched=全局一对一对应唯一；insufficient_evidence=证据不足；"
+            "no_complete_matching=候选拼不成完整对应；ambiguous=存在多种对应"
+        )
+    )
+    commit_seq: int = Field(description="本次比较所用的已提交快照序号")
+    window: QueryWindow
+    pairs: list[MatchedPair] = Field(
+        description="仅 status=matched 时返回全部配对；其余情况为空，不猜测部分配对"
+    )
+    reason: str | None = Field(description="未唯一匹配时的原因说明")
+    details: dict[str, Any] | None = Field(
+        default=None, description="补充诊断信息（缺候选的编号、候选对数等）"
+    )

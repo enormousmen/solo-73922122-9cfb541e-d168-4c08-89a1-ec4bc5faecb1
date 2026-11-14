@@ -117,6 +117,56 @@ python3 -m pytest                                        # 含双进程并发/�
 
 `GET /api/v1/meters` 列出所有电表的汇总。无任何读数的电表返回 404。
 
+### 匹配 — `POST /api/v1/meters/match`
+
+**只读**接口：网关维护后部分电表换了上报编号，旧号与新号在交接时段同时
+上传读数。该接口确认旧号与新号的一对一对应，避免数仓把同一电表算两次。
+
+```json
+{
+  "old_meter_ids": ["M-1001", "M-1002"],
+  "new_meter_ids": ["M-2001", "M-2002"],
+  "window": {"from": "2026-10-01T00:00:00Z", "to": "2026-10-01T08:00:00Z"}
+}
+```
+
+* 旧号、新号各 2～6 个、数量相同且全部互异；`window` 为最长 24 小时的
+  UTC 重叠时段（含端点）。
+* 比较**同一已提交快照**（响应带 `commit_seq`）中双方**同起止时刻**、
+  完全落在重叠时段内的有效区间。
+* 某对旧/新号成立的条件：存在**连续三段**共同有效区间用量相同，且这三段
+  中**至少出现两种不同的正用量**；共同有效区间一旦出现用量冲突，该组合
+  直接排除；断点或缺采样会打断连续证据，不能拼接。
+* 仅当全局一对一对应**唯一**时返回 `status=matched`、全部配对及每段证据
+  的源记录号；否则 `pairs` 为空并说明原因，不猜测部分配对：
+  * `insufficient_evidence`：证据不足（某编号在窗口内没有有效区间，或
+    与任何对方编号都凑不齐连续三段相同用量 / 存在用量冲突）；
+  * `no_complete_matching`：候选配对拼不成覆盖全部编号的一对一对应；
+  * `ambiguous`：存在多种一对一对应，无法唯一确定。
+
+响应示例（唯一对应时）：
+
+```json
+{
+  "status": "matched",
+  "commit_seq": 7,
+  "window": {"from": "2026-10-01T00:00:00Z", "to": "2026-10-01T08:00:00Z",
+             "applied": true},
+  "pairs": [{
+    "old_meter_id": "M-1001",
+    "new_meter_id": "M-2001",
+    "evidence": [{
+      "from_read_at": "...", "to_read_at": "...", "usage": 120,
+      "old_from_source_record_id": "gw-0041",
+      "old_to_source_record_id": "gw-0042",
+      "new_from_source_record_id": "gw-1107",
+      "new_to_source_record_id": "gw-1108"
+    }]
+  }],
+  "reason": null
+}
+```
+
 ### 错误
 
 | 状态码 | 含义 |
@@ -158,10 +208,12 @@ python3 -m pytest                                        # 含双进程并发/�
 ## 测试
 
 ```bash
-python3 -m pytest            # 37 个用例
+python3 -m pytest            # 56 个用例
 ```
 
 * `tests/test_api.py`：区间/断点/乱序/幂等/冲突/撤销/窗口/校验。
+* `tests/test_matching.py`：旧新编号匹配的唯一对应、证据不足、无完整对应、
+  多种对应、断点/缺采样打断连续证据、用量冲突、窗口与入参校验。
 * `tests/test_concurrency.py`：启动两个真实进程共享同一个 SQLite 文件，
   并发写、并发重试、竞争冲突、持续读写一致性、进程崩溃（`os._exit`）、
   重启后数据延续、未提交事务回滚。

@@ -91,6 +91,72 @@ def main(base_url: str, second_url: str | None = None) -> int:
         listing = client.get("/api/v1/meters").json()
         assert any(m["meter_id"] == "E2E-M1" for m in listing)
 
+        # Read-only old/new id matching: two renamed meters mirror two old
+        # ones with the same hourly usage profile during the overlap window.
+        def profile_readings(meter, prefix, base, usages):
+            rows = [
+                {
+                    "meter_id": meter,
+                    "source_record_id": f"{prefix}-0",
+                    "read_at": "2026-02-03T00:00:00Z",
+                    "reading": base,
+                }
+            ]
+            value = base
+            for index, usage in enumerate(usages):
+                value += usage
+                rows.append(
+                    {
+                        "meter_id": meter,
+                        "source_record_id": f"{prefix}-{index + 1}",
+                        "read_at": f"2026-02-03T0{index + 1}:00:00Z",
+                        "reading": value,
+                    }
+                )
+            return rows
+
+        match_batch = []
+        match_batch += profile_readings("E2E-OLD-1", "e2e-o1", 100, [10, 20, 30])
+        match_batch += profile_readings("E2E-OLD-2", "e2e-o2", 500, [1, 2, 3])
+        match_batch += profile_readings("E2E-NEW-1", "e2e-n1", 900, [1, 2, 3])
+        match_batch += profile_readings("E2E-NEW-2", "e2e-n2", 7000, [10, 20, 30])
+        assert client.post(
+            "/api/v1/readings", json={"readings": match_batch}
+        ).status_code == 200
+
+        matched = client.post(
+            "/api/v1/meters/match",
+            json={
+                "old_meter_ids": ["E2E-OLD-1", "E2E-OLD-2"],
+                "new_meter_ids": ["E2E-NEW-1", "E2E-NEW-2"],
+                "window": {
+                    "from": "2026-02-03T00:00:00Z",
+                    "to": "2026-02-03T06:00:00Z",
+                },
+            },
+        )
+        assert matched.status_code == 200, matched.text
+        matched_body = matched.json()
+        assert matched_body["status"] == "matched", matched_body
+        pairs = {p["old_meter_id"]: p["new_meter_id"] for p in matched_body["pairs"]}
+        assert pairs == {"E2E-OLD-1": "E2E-NEW-2", "E2E-OLD-2": "E2E-NEW-1"}
+        assert all(len(p["evidence"]) == 3 for p in matched_body["pairs"])
+        print("matching:", pairs)
+
+        too_long = client.post(
+            "/api/v1/meters/match",
+            json={
+                "old_meter_ids": ["E2E-OLD-1", "E2E-OLD-2"],
+                "new_meter_ids": ["E2E-NEW-1", "E2E-NEW-2"],
+                "window": {
+                    "from": "2026-02-03T00:00:00Z",
+                    "to": "2026-02-04T01:00:00Z",  # > 24h window
+                },
+            },
+        )
+        assert too_long.status_code == 422, too_long.text
+        print("over-24h window rejected with 422")
+
     # Optional: prove both processes serve the same data.
     if second_url:
         with httpx.Client(base_url=second_url, timeout=30.0) as other:
@@ -108,6 +174,7 @@ def main(base_url: str, second_url: str | None = None) -> int:
         assert "/api/v1/readings" in paths
         assert "/api/v1/readings/undo" in paths
         assert "/api/v1/meters/{meter_id}" in paths
+        assert "/api/v1/meters/match" in paths
     print("openapi paths ok")
     return 0
 

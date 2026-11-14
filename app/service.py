@@ -37,6 +37,10 @@ from .db import (
 from .models import (
     ConflictDetail,
     IntervalOut,
+    MatchEvidenceSegment,
+    MatchedPair,
+    MatchRequest,
+    MatchResponse,
     MeterStateResponse,
     MeterSummary,
     MutationResponse,
@@ -598,4 +602,290 @@ def query_meter(
                 intervals=interval_outs,
                 breaks=breaks,
                 usage_total=int(usage_total),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Old/new meter-id matching (read-only)
+# ---------------------------------------------------------------------------
+#
+# After gateway maintenance some meters report under a new id while the old id
+# is still uploading.  Both ids therefore share an overlap period.  A pair of
+# ids is a *candidate* when, inside the requested UTC window:
+#
+# * no common valid interval (same start/end instant on both sides, both
+#   usable) shows a different usage — a usage conflict forbids the pair; and
+# * there are three consecutive common valid intervals with identical usage,
+#   containing at least two distinct positive usage values.  Breaks and
+#   missing samples interrupt consecutiveness: intervals are adjacent only
+#   when one's end instant is the next one's start instant, and a common
+#   interval can only exist when neither side has a break or a gap there.
+#
+# The answer is published only when the candidate graph between the old and
+# the new ids admits exactly one perfect one-to-one matching.
+
+
+@dataclass
+class _Segment:
+    """One stored interval of a meter, with the source record ids as proof."""
+
+    from_us: int
+    to_us: int
+    usage: int | None
+    is_break: bool
+    from_source: str
+    to_source: str
+
+
+def _load_segments(
+    conn: sqlite3.Connection,
+    meter_ids: Sequence[str],
+    from_us: int,
+    to_us: int,
+) -> dict[str, list[_Segment]]:
+    """Load every stored interval fully inside the window for each meter."""
+    segments: dict[str, list[_Segment]] = {meter_id: [] for meter_id in meter_ids}
+    if not meter_ids:
+        return segments
+    placeholders = ",".join("?" for _ in meter_ids)
+    rows = conn.execute(
+        "SELECT i.meter_id, i.from_at_us, i.to_at_us, i.usage, i.is_break, "
+        "f.source_record_id AS from_source, t.source_record_id AS to_source "
+        "FROM intervals i "
+        "JOIN readings f ON f.id = i.from_reading_id "
+        "JOIN readings t ON t.id = i.to_reading_id "
+        f"WHERE i.meter_id IN ({placeholders}) "
+        "AND i.from_at_us >= ? AND i.to_at_us <= ? "
+        "ORDER BY i.meter_id, i.from_at_us",
+        [*meter_ids, from_us, to_us],
+    ).fetchall()
+    for row in rows:
+        segments[row["meter_id"]].append(
+            _Segment(
+                from_us=int(row["from_at_us"]),
+                to_us=int(row["to_at_us"]),
+                usage=None if row["usage"] is None else int(row["usage"]),
+                is_break=bool(row["is_break"]),
+                from_source=row["from_source"],
+                to_source=row["to_source"],
+            )
+        )
+    return segments
+
+
+def _pair_evidence(
+    old_segments: list[_Segment], new_segments: list[_Segment]
+) -> list[tuple[_Segment, _Segment]] | None:
+    """Return the evidence triple for one old/new pair, or ``None``.
+
+    ``None`` means the pair cannot hold: either a common valid interval shows
+    conflicting usage, or no three consecutive common valid intervals with
+    identical usage and two distinct positive values exist.
+    """
+    old_by_key = {(seg.from_us, seg.to_us): seg for seg in old_segments}
+    new_by_key = {(seg.from_us, seg.to_us): seg for seg in new_segments}
+
+    matching: list[tuple[_Segment, _Segment]] = []
+    for key in sorted(set(old_by_key) & set(new_by_key)):
+        old_seg = old_by_key[key]
+        new_seg = new_by_key[key]
+        if old_seg.is_break or new_seg.is_break:
+            # Not a common *valid* interval: no usage conflict, but it cannot
+            # serve as evidence either.
+            continue
+        if old_seg.usage != new_seg.usage:
+            return None  # usage conflict on a common valid interval
+        matching.append((old_seg, new_seg))
+
+    # Split into runs of time-adjacent segments.  A break or a missing sample
+    # on either side removes the common interval and therefore cuts the run.
+    runs: list[list[tuple[_Segment, _Segment]]] = []
+    current: list[tuple[_Segment, _Segment]] = []
+    for pair in matching:
+        if current and current[-1][0].to_us != pair[0].from_us:
+            if len(current) >= 3:
+                runs.append(current)
+            current = []
+        current.append(pair)
+    if len(current) >= 3:
+        runs.append(current)
+
+    for run in runs:
+        for start in range(len(run) - 2):
+            triple = run[start : start + 3]
+            positives = {
+                old_seg.usage
+                for old_seg, _ in triple
+                if old_seg.usage is not None and old_seg.usage > 0
+            }
+            if len(positives) >= 2:
+                return triple
+    return None
+
+
+def _perfect_matchings(
+    old_ids: Sequence[str],
+    candidates: dict[str, set[str]],
+    limit: int | None = None,
+) -> list[dict[str, str]]:
+    """Enumerate one-to-one assignments old -> new (optionally capped)."""
+    matchings: list[dict[str, str]] = []
+    order = sorted(old_ids, key=lambda old_id: (len(candidates[old_id]), old_id))
+    assignment: dict[str, str] = {}
+    used: set[str] = set()
+
+    def backtrack(index: int) -> None:
+        if limit is not None and len(matchings) >= limit:
+            return
+        if index == len(order):
+            matchings.append(dict(assignment))
+            return
+        old_id = order[index]
+        for new_id in sorted(candidates[old_id]):
+            if new_id in used:
+                continue
+            used.add(new_id)
+            assignment[old_id] = new_id
+            backtrack(index + 1)
+            del assignment[old_id]
+            used.remove(new_id)
+
+    backtrack(0)
+    return matchings
+
+
+def _evidence_out(
+    triple: Sequence[tuple[_Segment, _Segment]],
+) -> list[MatchEvidenceSegment]:
+    return [
+        MatchEvidenceSegment(
+            from_read_at=microseconds_to_iso(old_seg.from_us),
+            to_read_at=microseconds_to_iso(old_seg.to_us),
+            usage=int(old_seg.usage),  # valid intervals always carry a usage
+            old_from_source_record_id=old_seg.from_source,
+            old_to_source_record_id=old_seg.to_source,
+            new_from_source_record_id=new_seg.from_source,
+            new_to_source_record_id=new_seg.to_source,
+        )
+        for old_seg, new_seg in triple
+    ]
+
+
+def match_meters(settings: Settings, request: MatchRequest) -> MatchResponse:
+    """Match old meter ids to new ones from one committed snapshot.
+
+    Read-only: everything is loaded inside a single read transaction, so all
+    compared intervals belong to the same committed state.
+    """
+    from_us = to_microseconds(request.window.from_)
+    to_us = to_microseconds(request.window.to)
+    old_ids = list(request.old_meter_ids)
+    new_ids = list(request.new_meter_ids)
+    window = QueryWindow(
+        from_=microseconds_to_iso(from_us),
+        to=microseconds_to_iso(to_us),
+        applied=True,
+    )
+
+    def respond(
+        status: str,
+        reason: str | None,
+        pairs: list[MatchedPair] | None = None,
+        details: dict | None = None,
+    ) -> MatchResponse:
+        return MatchResponse(
+            status=status,  # type: ignore[arg-type]
+            commit_seq=commit_seq,
+            window=window,
+            pairs=pairs or [],
+            reason=reason,
+            details=details,
+        )
+
+    with connection(settings) as conn:
+        with read_transaction(conn):
+            commit_seq = current_commit_seq(conn)
+            segments = _load_segments(
+                conn, [*old_ids, *new_ids], from_us, to_us
+            )
+
+            evidence: dict[tuple[str, str], list[tuple[_Segment, _Segment]]] = {}
+            candidates: dict[str, set[str]] = {old_id: set() for old_id in old_ids}
+            for old_id in old_ids:
+                for new_id in new_ids:
+                    triple = _pair_evidence(segments[old_id], segments[new_id])
+                    if triple is not None:
+                        candidates[old_id].add(new_id)
+                        evidence[(old_id, new_id)] = triple
+
+            candidate_count = sum(len(ids) for ids in candidates.values())
+            isolated_old = [old_id for old_id in old_ids if not candidates[old_id]]
+            covered_new: set[str] = set()
+            for ids in candidates.values():
+                covered_new |= ids
+            isolated_new = [
+                new_id for new_id in new_ids if new_id not in covered_new
+            ]
+
+            if isolated_old or isolated_new:
+                parts: list[str] = []
+                for old_id in isolated_old:
+                    if not segments[old_id]:
+                        parts.append(f"旧号 {old_id} 在重叠时段内没有有效区间")
+                    else:
+                        parts.append(
+                            f"旧号 {old_id} 与任何新号都凑不齐连续三段相同用量"
+                            "（或存在用量冲突）"
+                        )
+                for new_id in isolated_new:
+                    if not segments[new_id]:
+                        parts.append(f"新号 {new_id} 在重叠时段内没有有效区间")
+                    else:
+                        parts.append(
+                            f"新号 {new_id} 与任何旧号都凑不齐连续三段相同用量"
+                            "（或存在用量冲突）"
+                        )
+                return respond(
+                    "insufficient_evidence",
+                    "证据不足：" + "；".join(parts),
+                    details={
+                        "old_meters_without_candidate": isolated_old,
+                        "new_meters_without_candidate": isolated_new,
+                        "candidate_pair_count": candidate_count,
+                    },
+                )
+
+            matchings = _perfect_matchings(old_ids, candidates)
+            if not matchings:
+                return respond(
+                    "no_complete_matching",
+                    "无完整对应：候选配对无法组成覆盖全部 "
+                    f"{len(old_ids)} 只电表的一对一对应",
+                    details={"candidate_pair_count": candidate_count},
+                )
+            if len(matchings) > 1:
+                return respond(
+                    "ambiguous",
+                    f"存在 {len(matchings)} 种不同的一对一对应，无法唯一确定，"
+                    "不输出任何配对",
+                    details={
+                        "candidate_pair_count": candidate_count,
+                        "possible_matching_count": len(matchings),
+                    },
+                )
+
+            assignment = matchings[0]
+            pairs = [
+                MatchedPair(
+                    old_meter_id=old_id,
+                    new_meter_id=assignment[old_id],
+                    evidence=_evidence_out(evidence[(old_id, assignment[old_id])]),
+                )
+                for old_id in sorted(old_ids)
+            ]
+            return respond(
+                "matched",
+                None,
+                pairs=pairs,
+                details={"candidate_pair_count": candidate_count},
             )
